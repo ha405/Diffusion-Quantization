@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dylib
+*.pyd
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# PyTorch / Torch
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# Diffusers / Hugging Face cache
+cache/
+*.cache/
+~/.cache/huggingface/
+~/.cache/torch/
+
+# Generated images / outputs
+quantized_results/
+baseline_results/
+outputs/
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Logs
+*.log
+*.out
+*.err
+
+# Misc
+.DS_Store
+*.ipynb_checkpoints
+.idea/
+.vscode/
+*.swp

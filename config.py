@@ -1,6 +1,4 @@
-
 import torch
-
 class Config:
     MODEL_ID = "facebook/DiT-XL-2-256"
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -11,5 +9,5 @@ class Config:
     TIMESTEP_INPUT_DIM = 1  
     TIMESTEP_EMBEDDING_DIM = 1152
     PREDICTOR_HIDDEN_DIM = 64
-    PREDICTOR_OUTPUT_DIM = 2 
+    PREDICTOR_OUTPUT_DIM = 1
     OUTPUT_DIR = "./output_images"

@@ -50,6 +50,7 @@ class SNR_TDQ_MLP(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
+            nn.Dropout(0.2),
             nn.Linear(hidden_dim, 1),
             nn.Softplus() 
         )
