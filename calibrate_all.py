@@ -3,21 +3,37 @@ import torch.nn as nn
 import torch.optim as optim
 import gc
 import os
+import json
+import itertools
 from diffusers import StableDiffusionPipeline, DDIMScheduler
 from networks import SNR_TDQ_MLP, TDQ_MLP
 from scheduler import NoiseScheduler
 
-
+# Configuration
 MODEL_ID = "runwayml/stable-diffusion-v1-5" 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAVE_PATH = "quant_checkpoint_sd.pt"
+DEBUG_JSON_PATH = "debug_stats.json"
 BASELINE_DIR = "baseline_results"
 
-NUM_CALIB_IMAGES = 100 
+NUM_CALIB_IMAGES = 64
 NUM_INFERENCE_STEPS = 50
 QUANT_METHOD = "snr"
 
-PROMPTS = [
+CALIB_PROMPTS = [
+    "A portrait of a cyberpunk robot in a neon city, 8k, highly detailed",
+    "An oil painting of a cottage in the mountains with a river",
+    "A cute golden retriever puppy running in a park, photorealistic",
+    "Abstract geometric shapes floating in a void, matte painting",
+    "A futuristic space station orbiting a blue planet",
+    "A bowl of fresh fruit on a wooden table, still life",
+    "A medieval knight in armor standing in a stone hallway",
+    "A macro photograph of a water droplet on a green leaf",
+    "An anime style illustration of a girl looking at the sunset",
+    "A dark fantasy forest with glowing mushrooms and fog"
+]
+
+BASELINE_PROMPTS = [
     "A cyberpunk city street at night, neon lights, rain, highly detailed",
     "A cute golden retriever puppy running in a park, 4k",
     "An oil painting of a cottage in the mountains",
@@ -53,15 +69,14 @@ def get_optimal_interval(activation, n_bits=8):
     
     base_scale = abs_max / q_max
     
+    # Grid search for optimal scale to minimize MSE
     candidates = torch.linspace(base_scale * 0.3, base_scale * 1.2, 40, device=activation.device)
     
     best_loss = float('inf')
     best_s = candidates[-1]
     
-    if activation.numel() > 20000:
-        check_act = activation.flatten()[::20] 
-    else:
-        check_act = activation
+    # Optimization: If tensor is huge, subsample for speed (optional, kept off for accuracy)
+    check_act = activation
 
     for s in candidates:
         s = torch.max(s, torch.tensor(1e-9, device=s.device))
@@ -76,6 +91,7 @@ def get_optimal_interval(activation, n_bits=8):
 
 class OnlineStatsCollector:
     def __init__(self, layer_names):
+        # Stores just the float values to save memory
         self.stats = {ln: [] for ln in layer_names}
 
     def get_hook(self, layer_name):
@@ -83,8 +99,10 @@ class OnlineStatsCollector:
             if not isinstance(output, torch.Tensor):
                 return
             
+            # Detach to ensure no gradients are tracked
             act = output.detach()
             s_val = get_optimal_interval(act, n_bits=8)
+            # Store as python float
             self.stats[layer_name].append(s_val.cpu().item())
         return hook
 
@@ -105,19 +123,20 @@ def calibrate_and_save():
         num_train_timesteps=1000
     )
 
+    # --- 1. Generate Baseline Images ---
     print(f"Generating Baseline Images to {BASELINE_DIR}...")
     os.makedirs(BASELINE_DIR, exist_ok=True)
     generator = torch.Generator(device=DEVICE).manual_seed(42)
     
     with torch.no_grad():
-        images = pipe(prompt=PROMPTS, num_inference_steps=NUM_INFERENCE_STEPS, generator=generator).images
+        images = pipe(prompt=BASELINE_PROMPTS, num_inference_steps=NUM_INFERENCE_STEPS, generator=generator).images
     
     for i, img in enumerate(images):
         save_path = os.path.join(BASELINE_DIR, f"baseline_{i}.png")
         img.save(save_path)
         print(f"Saved baseline: {save_path}")
 
-
+    # --- 2. Prepare for Calibration ---
     all_linear_layers = get_all_linear_layers(pipe.unet)
     print(f"Found {len(all_linear_layers)} linear layers. Starting calibration...")
 
@@ -132,12 +151,36 @@ def calibrate_and_save():
         except AttributeError:
             pass
 
-    print("Running calibration inference...")
-    with torch.no_grad():
-        pipe(prompt=[""]*NUM_CALIB_IMAGES, num_inference_steps=NUM_INFERENCE_STEPS, generator=generator)
+    # --- 3. Run Calibration Inference (Batched) ---
+    print(f"Running calibration inference on {NUM_CALIB_IMAGES} images...")
+    
+    # Iterator to cycle through real prompts
+    prompt_iterator = itertools.cycle(CALIB_PROMPTS)
+    
+    # Batch size of 1 to prevent OOM
+    batch_size = 1
+    
+    for i in range(0, NUM_CALIB_IMAGES, batch_size):
+        # Get next prompts
+        current_prompts = [next(prompt_iterator) for _ in range(batch_size)]
+        
+        with torch.no_grad():
+            pipe(
+                prompt=current_prompts, 
+                num_inference_steps=NUM_INFERENCE_STEPS, 
+                generator=generator
+            )
+        
+        # Explicit garbage collection to keep memory clean
+        if i % 10 == 0:
+            print(f"Processed {i}/{NUM_CALIB_IMAGES} images...")
+            gc.collect()
+            if DEVICE == 'cuda': torch.cuda.empty_cache()
 
+    # Remove hooks
     for h in handles: h.remove()
 
+    # --- 4. Prepare Training Data ---
     timesteps_cpu = pipe.scheduler.timesteps.cpu()
     noise_sched = NoiseScheduler(num_timesteps=1000, schedule="linear")
     
@@ -151,16 +194,20 @@ def calibrate_and_save():
         "method": QUANT_METHOD,
         "layers": {}
     }
+    
+    debug_stats = {}
 
     print("Training MLPs...")
     layers_trained = 0
     
+    # --- 5. Train MLPs per Layer ---
     for idx, layer_name in enumerate(all_linear_layers):
         s_targets_list = collector.stats[layer_name]
         
         if not s_targets_list:
             continue
 
+        # Match collected stats to timesteps
         num_samples = len(s_targets_list)
         num_steps = len(timesteps_cpu)
         
@@ -175,6 +222,7 @@ def calibrate_and_save():
         s_tensor = torch.tensor(s_targets_list, dtype=torch.float32).to(DEVICE).view(-1, 1)
         t_tensor = t_vals.to(DEVICE).long()
         
+        # Choose Network Input (SNR or Time)
         if QUANT_METHOD == "snr":
             model_input = noise_sched.get_log_snr(t_tensor).view(-1, 1)
             mlp = SNR_TDQ_MLP().to(DEVICE)
@@ -185,22 +233,41 @@ def calibrate_and_save():
         opt = optim.Adam(mlp.parameters(), lr=1e-3)
         loss_fn = nn.MSELoss()
         
-        for _ in range(100):
+        final_loss = 0.0
+        
+        # Train MLP
+        for _ in range(200):
             opt.zero_grad()
             pred = mlp(model_input)
             loss = loss_fn(pred, s_tensor)
             loss.backward()
             opt.step()
+            final_loss = loss.item()
 
+        # Save Weights
         quant_registry["layers"][layer_name] = mlp.state_dict()
+        
+        # Save Debug Stats
+        debug_stats[layer_name] = {
+            "min_scale": min(s_targets_list),
+            "max_scale": max(s_targets_list),
+            "final_mse_loss": final_loss,
+            "samples_collected": len(s_targets_list)
+        }
+
         layers_trained += 1
         
         if layers_trained % 50 == 0:
-            print(f"Trained {layers_trained}/{len(all_linear_layers)} layers.")
+            print(f"Trained {layers_trained}/{len(all_linear_layers)} layers. Last Loss: {final_loss:.6f}")
             if DEVICE == 'cuda': torch.cuda.empty_cache()
 
+    # --- 6. Save Results ---
     torch.save(quant_registry, SAVE_PATH)
     print(f"Calibration complete. Registry saved at {SAVE_PATH}")
+    
+    with open(DEBUG_JSON_PATH, "w") as f:
+        json.dump(debug_stats, f, indent=4)
+    print(f"Debug statistics saved at {DEBUG_JSON_PATH}")
 
 if __name__ == "__main__":
     calibrate_and_save()

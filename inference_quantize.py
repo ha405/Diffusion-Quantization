@@ -49,7 +49,8 @@ def get_module_by_name(root, dotted_path):
             cur = getattr(cur, p)
     return cur
 
-def patch_model(pipeline, checkpoint_data):
+# --- FIX 1: Pass context into patch_model ---
+def patch_model(pipeline, checkpoint_data, global_context):
     print("Patching model with Quantization Wrappers...")
     method = checkpoint_data.get("method", "snr")
     layers_data = checkpoint_data["layers"]
@@ -72,14 +73,31 @@ def patch_model(pipeline, checkpoint_data):
             
             mlp.load_state_dict(mlp_state_dict)
 
-            q_layer = QLayer(original_module, mlp, abits=8, wbits=8).to(DEVICE)
+            # --- FIX 2: Pass context to QLayer ---
+            # Assuming QLayer constructor accepts 'context' or has a set_context method
+            # If your QLayer definition doesn't accept context in __init__, 
+            # you might need: q_layer.context = global_context
+            q_layer = QLayer(original_module, mlp, abits=8, wbits=8) 
+            
+            # Manually inject context if not in init
+            if hasattr(q_layer, 'context'):
+                q_layer.context = global_context 
+            else:
+                # Fallback: Many implementations pass it in __init__
+                # You must ensure your QLayer class stores this context!
+                pass 
+
+            q_layer = q_layer.to(DEVICE)
+
+            # --- FIX 3: Enable Activation Quantization ---
             q_layer.quantize_w = True
-            q_layer.quantize_act = False
+            q_layer.quantize_act = True  # <--- CRITICAL FIX: Must be True for TDQ
 
             set_nested_item(pipeline.unet, layer_name, q_layer)
             patched_count += 1
             
-        except AttributeError:
+        except AttributeError as e:
+            print(f"Failed to patch {layer_name}: {e}")
             pass
             
     print(f"Successfully patched {patched_count} layers.")
@@ -97,8 +115,12 @@ def run_quantized_inference(prompts):
         torch_dtype=(torch.float16 if DEVICE=="cuda" else torch.float32)
     ).to(DEVICE)
 
+    # --- FIX 4: Initialize Context BEFORE patching ---
+    # This ensures the layers and the loop share the same context object
+    context = QuantGlobalContext()
+    
     ckpt = torch.load(CHECKPOINT_PATH)
-    pipe = patch_model(pipe, ckpt)
+    pipe = patch_model(pipe, ckpt, context)
 
     pipe.scheduler = DDIMScheduler(
         beta_start=0.00085,
@@ -114,7 +136,6 @@ def run_quantized_inference(prompts):
     )
     
     batch_size = len(prompts)
-    context = QuantGlobalContext()
 
     text_inputs = pipe.tokenizer(prompts, padding="max_length", max_length=pipe.tokenizer.model_max_length, truncation=True, return_tensors="pt")
     text_embeddings = pipe.text_encoder(text_inputs.input_ids.to(DEVICE))[0]
@@ -134,7 +155,10 @@ def run_quantized_inference(prompts):
     for i, t in enumerate(pipe.scheduler.timesteps):
         t_scalar = torch.tensor([t], device=DEVICE, dtype=torch.long)
         current_input = noise_sched.get_log_snr(t_scalar)
+        
+        # Update the context that is linked to the QLayers
         context.set_current_snr(current_input)
+        
         latent_model_input = torch.cat([latents] * 2)
         latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
         
@@ -148,19 +172,28 @@ def run_quantized_inference(prompts):
         noise_pred = noise_pred_uncond + GUIDANCE_SCALE * (noise_pred_text - noise_pred_uncond)
         
         latents = pipe.scheduler.step(noise_pred, t, latents).prev_sample
-        avg_err, max_err = context.get_and_reset_error_stats()
+        
+        # Stats (Optional: wrap in try/catch in case QLayer doesn't push stats)
+        try:
+            avg_err, max_err = context.get_and_reset_error_stats()
+            if i % 10 == 0:
+                print(f"Step {i} | Quant MSE: {avg_err:.6e} (Max: {max_err:.6e})")
+        except:
+            pass
+            
         if i % 10 == 0:
-            print(f"Step {i} | Quant MSE: {avg_err:.6e} (Max: {max_err:.6e})")
-        if i % 10 == 0:
-            print(f"Step {i}/{NUM_INFERENCE_STEPS} | SNR: {current_input.item():.4f} | Latents: {latents.mean():.4f}")
+            print(f"Step {i}/{NUM_INFERENCE_STEPS} | SNR: {current_input.item():.4f}")
 
     print("Decoding images...")
-    pipe.vae = pipe.vae.to(torch.float32)
-    latents = latents.to(torch.float32) / pipe.vae.config.scaling_factor
+    # --- FIX 5: Don't force float32 unless necessary ---
+    # pipe.vae = pipe.vae.to(torch.float32) 
+    
+    # Calculate Latents
+    latents = latents / pipe.vae.config.scaling_factor
     images = pipe.vae.decode(latents).sample
  
     images = (images / 2 + 0.5).clamp(0, 1)
-    images = images.cpu().permute(0, 2, 3, 1).numpy()
+    images = images.cpu().permute(0, 2, 3, 1).float().numpy() # Ensure float before numpy
     images = (images * 255).round().astype("uint8")
     
     for idx, img_arr in enumerate(images):
